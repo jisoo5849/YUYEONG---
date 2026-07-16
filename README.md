@@ -1,6 +1,8 @@
 # YUYEONG — 오늘의 경험을 설계하는 AI Agent
 
-![YUYEONG social preview](public/og.png)
+<p align="center">
+  <img src="./public/og.png" alt="YUYEONG — 오늘의 경험을 설계하는 AI Agent" width="1200" />
+</p>
 
 > 점심, 카페, 저녁, 드라이브를 따로 추천하지 않고 사용자의 취향·시간·날씨·예산·실제 이동시간을 함께 판단해 **오늘의 경험 전체**를 하나의 동선으로 설계하는 웹 기반 AI Agent입니다.
 
