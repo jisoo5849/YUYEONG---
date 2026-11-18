@@ -31,6 +31,13 @@ const localBindingConfig = {
         },
       ]
     : [],
+  // Result cache (places, weather, full plans) shared by every Worker instance.
+  kv_namespaces: [
+    {
+      binding: "YUYEONG_CACHE",
+      id: "3bcfd905c83a4a2c8d1572cfa213d8bf",
+    },
+  ],
 };
 
 export default defineConfig(async () => {

@@ -276,8 +276,14 @@ async function getWeather(coordinates: Coordinates): Promise<Weather> {
   const weatherKey = `${coordinates.latitude.toFixed(2)},${coordinates.longitude.toFixed(2)}`;
   const cachedWeather = cacheGet(weatherCache, weatherKey);
   if (cachedWeather) return cachedWeather;
+  const storedWeather = await kvRead<Weather>("weather", weatherKey);
+  if (storedWeather && typeof storedWeather.temperature === "number") {
+    cacheSet(weatherCache, weatherKey, storedWeather, 5 * 60 * 1000);
+    return storedWeather;
+  }
   const fresh = await loadWeather(coordinates);
   cacheSet(weatherCache, weatherKey, fresh, WEATHER_TTL_MS);
+  await kvWrite("weather", weatherKey, fresh, WEATHER_TTL_MS);
   return fresh;
 }
 
@@ -333,21 +339,67 @@ function cacheSet<T>(map: Map<string, CacheEntry<T>>, key: string, value: T, ttl
 }
 
 type PlacesResult = { elements: OSMElement[]; localRadius: number; driveRadius: number; source: "overpass" | "nominatim" };
-const PLACES_TTL_MS = 6 * 60 * 60 * 1000;
+const PLACES_TTL_MS = 24 * 60 * 60 * 1000;
 const PLACES_FALLBACK_TTL_MS = 20 * 60 * 1000; // retry the richer Overpass data sooner
 const WEATHER_TTL_MS = 15 * 60 * 1000;
-const RESPONSE_TTL_MS = 15 * 60 * 1000;
+const RESPONSE_TTL_MS = 60 * 60 * 1000;
 const RESPONSE_DEGRADED_TTL_MS = 2 * 60 * 1000;
 const placesCache = new Map<string, CacheEntry<PlacesResult>>();
 const weatherCache = new Map<string, CacheEntry<Weather>>();
 const responseCache = new Map<string, CacheEntry<Record<string, unknown>>>();
 
+// A Worker instance forgets its memory often and requests land on different instances, so results
+// are also kept in Cloudflare KV (binding YUYEONG_CACHE). Every KV call is best-effort: if the
+// binding is missing (tests, local runs) or fails, the app simply recomputes.
+type KvLike = {
+  get(key: string, type: "json"): Promise<unknown>;
+  put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>;
+};
+async function getKv(): Promise<KvLike | null> {
+  try {
+    const { env } = (await import("cloudflare:workers")) as unknown as { env: { YUYEONG_CACHE?: KvLike } };
+    return env.YUYEONG_CACHE ?? null;
+  } catch {
+    return null;
+  }
+}
+async function kvKeyFor(prefix: string, text: string) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  const hex = [...new Uint8Array(digest)].slice(0, 16).map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `v1:${prefix}:${hex}`;
+}
+async function kvRead<T>(prefix: string, text: string): Promise<T | null> {
+  try {
+    const kv = await getKv();
+    if (!kv) return null;
+    return ((await kv.get(await kvKeyFor(prefix, text), "json")) as T | null) ?? null;
+  } catch {
+    return null;
+  }
+}
+async function kvWrite(prefix: string, text: string, value: unknown, ttlMs: number) {
+  try {
+    const kv = await getKv();
+    if (!kv) return;
+    await kv.put(await kvKeyFor(prefix, text), JSON.stringify(value), { expirationTtl: Math.max(60, Math.round(ttlMs / 1000)) });
+  } catch {
+    // Caching is optional.
+  }
+}
+
 async function getPlaces(origin: Coordinates, includeDrive: boolean, expanded = false): Promise<PlacesResult> {
   const key = `${origin.latitude.toFixed(3)},${origin.longitude.toFixed(3)}|${includeDrive ? "drive" : "local"}|${expanded ? "wide" : "base"}`;
   const cached = cacheGet(placesCache, key);
   if (cached) return cached;
+  const stored = await kvRead<PlacesResult>("places", key);
+  if (stored && Array.isArray(stored.elements)) {
+    cacheSet(placesCache, key, stored, 10 * 60 * 1000);
+    return stored;
+  }
   const fresh = await loadPlaces(origin, includeDrive, expanded);
-  cacheSet(placesCache, key, fresh, fresh.source === "overpass" ? PLACES_TTL_MS : PLACES_FALLBACK_TTL_MS);
+  const ttl = fresh.source === "overpass" ? PLACES_TTL_MS : PLACES_FALLBACK_TTL_MS;
+  cacheSet(placesCache, key, fresh, ttl);
+  await kvWrite("places", key, fresh, ttl);
   return fresh;
 }
 
@@ -1072,7 +1124,14 @@ export async function POST(request: NextRequest) {
       coordinatesInput ? [coordinatesInput.latitude.toFixed(4), coordinatesInput.longitude.toFixed(4)] : null,
       companion, mood, startTime, endTime, requestedTransport, [...activities].sort(), preferences, budgetTier,
     ]);
-    const cachedResponse = cacheGet(responseCache, responseKey);
+    let cachedResponse = cacheGet(responseCache, responseKey);
+    if (!cachedResponse) {
+      const stored = await kvRead<Record<string, unknown>>("plan", responseKey);
+      if (stored && stored.stops && stored.recommendations) {
+        cachedResponse = stored;
+        cacheSet(responseCache, responseKey, stored, 5 * 60 * 1000, 40);
+      }
+    }
     if (cachedResponse) {
       return NextResponse.json({ ...cachedResponse, meta: { ...(cachedResponse.meta as Record<string, unknown>), cached: true } });
     }
@@ -1494,7 +1553,9 @@ export async function POST(request: NextRequest) {
     };
     // Keep full results briefly; degraded ones (model or route fell back) only for a moment.
     const degraded = model.status !== "active" || route.source !== "OSRM";
-    cacheSet(responseCache, responseKey, payload as Record<string, unknown>, degraded ? RESPONSE_DEGRADED_TTL_MS : RESPONSE_TTL_MS, 40);
+    const responseTtl = degraded ? RESPONSE_DEGRADED_TTL_MS : RESPONSE_TTL_MS;
+    cacheSet(responseCache, responseKey, payload as Record<string, unknown>, responseTtl, 40);
+    if (!degraded) await kvWrite("plan", responseKey, payload, responseTtl);
     return NextResponse.json(payload);
   } catch (error) {
     const message = error instanceof Error ? error.message : "하루의 경험을 설계하는 중 문제가 생겼어요.";
