@@ -1,12 +1,18 @@
 # YUYEONG — 오늘의 경험을 설계하는 AI Agent
 
 <p align="center">
-  <img src="./public/og.png" alt="YUYEONG — 오늘의 경험을 설계하는 AI Agent" width="1200" />
+  <img src="./YUYEONG-github-portfolio/public/og.png" alt="YUYEONG — 오늘의 경험을 설계하는 AI Agent" width="1200" />
 </p>
+
+## 👉 [지금 바로 YUYEONG 체험하기](https://yuyeong-experience-agent.yuyeong.workers.dev)
+
+링크만 누르면 설치 없이 바로 사용해 볼 수 있습니다.
+
+> **유영의 기획부터 프론트엔드 디자인, 편리성 전부 다 제가 직접 세웠고, 개발시간은 5시간이었습니다.** ([만든 사람의 한마디](ABOUT.md))
 
 > 점심, 카페, 저녁, 드라이브를 따로 추천하지 않고 사용자의 취향·시간·날씨·예산·실제 이동시간을 함께 판단해 **오늘의 경험 전체**를 하나의 동선으로 설계하는 웹 기반 AI Agent입니다.
 
-[비공개 Live Demo](https://yuyeong-agent.jisoo584983761.chatgpt.site) · [기술스택 Notebook](portfolio/yuyeong_tech_stack.ipynb)
+[Live Demo](https://yuyeong-experience-agent.yuyeong.workers.dev) · [기술스택 Notebook](YUYEONG-github-portfolio/portfolio/yuyeong_tech_stack.ipynb)
 
 ## 프로젝트 요약
 
@@ -18,7 +24,7 @@
 | 핵심 가치 | 장소 목록이 아닌 실행 가능한 하루의 경험 설계 |
 | 주요 사용자 | 연인·친구·혼자 보내는 하루를 자연스럽게 계획하고 싶은 사람 |
 | 주요 결과 | 식당 4곳, 카페 4곳, 20분 이상 드라이브 4곳을 비교한 뒤 최종 동선 구성 |
-| 배포 | OpenAI Sites 비공개 프로덕션 |
+| 배포 | Cloudflare Workers 공개 배포 |
 
 ## Pipeline
 
@@ -176,7 +182,7 @@ Reason(private) → Action → Observation → Adapt/Replan → Verify → Stop
 | Geocoding | Nominatim | 사용자의 장소 문자열을 좌표로 변환 |
 | Weather | Open-Meteo | 현재 기온, 체감온도, 강수 가능성 |
 | Routing | OSRM Route·Table API | 전체 동선과 드라이브 후보의 도로 시간·거리 계산 |
-| Hosting | OpenAI Sites | 비공개 프로덕션 배포와 비밀 환경변수 관리 |
+| Hosting | Cloudflare Workers + Wrangler | 서버리스 공개 배포와 비밀 환경변수(`OPENAI_API_KEY`) 관리 |
 | Test | Node.js test runner | 서버 렌더링, 기능 계약, 안전 정책 회귀 테스트 |
 
 상세 기술스택과 저장소 진단 코드는 [`portfolio/yuyeong_tech_stack.ipynb`](portfolio/yuyeong_tech_stack.ipynb)에서 확인할 수 있습니다.
@@ -215,8 +221,8 @@ YUYEONG/
 ### 로컬 실행
 
 ```bash
-git clone <YOUR_REPOSITORY_URL>
-cd YUYEONG
+git clone https://github.com/jisoo5849/YUYEONG---.git
+cd YUYEONG---/YUYEONG-github-portfolio
 npm install
 ```
 

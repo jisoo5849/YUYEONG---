@@ -322,14 +322,55 @@ async function getPlaces(origin: Coordinates, includeDrive: boolean, expanded = 
     relation(around:${localRadius},${lat},${lon})["amenity"~"^(restaurant|fast_food|food_court|cafe)$"]["name"];
     ${driveQuery}
   );out center tags 520;`;
-  const response = await fetchWithTimeout("https://overpass-api.de/api/interpreter", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8", "User-Agent": APP_USER_AGENT },
-    body: new URLSearchParams({ data: query }),
-  }, 30000);
-  if (!response.ok) throw new Error("장소 검색 도구가 잠시 응답하지 않아요.");
-  const data = (await response.json()) as { elements?: OSMElement[] };
-  return { elements: data.elements ?? [], localRadius, driveRadius };
+  const elements = await fetchOverpassElements(query);
+  return { elements, localRadius, driveRadius };
+}
+
+// Public Overpass servers are shared and often hit their capacity limit (HTTP 429/502/504 or no
+// response). Try several independent servers in turn instead of failing on the first one.
+const OVERPASS_ENDPOINTS = [
+  "https://overpass-api.de/api/interpreter",
+  "https://lz4.overpass-api.de/api/interpreter",
+  "https://z.overpass-api.de/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+  "https://overpass.private.coffee/api/interpreter",
+];
+const OVERPASS_ATTEMPT_TIMEOUT_MS = 20000;
+const OVERPASS_TOTAL_BUDGET_MS = 60000;
+const OVERPASS_COOLDOWN_MS = 60000;
+const overpassCooldownUntil = new Map<string, number>();
+let overpassPreferred = 0;
+
+async function fetchOverpassElements(query: string): Promise<OSMElement[]> {
+  const startedAt = Date.now();
+  const now = () => Date.now();
+  // Healthy servers first (starting from the last one that worked), recently failed ones last.
+  const order = OVERPASS_ENDPOINTS.map((_, i) => (overpassPreferred + i) % OVERPASS_ENDPOINTS.length).map((i) => OVERPASS_ENDPOINTS[i]);
+  const healthy = order.filter((url) => (overpassCooldownUntil.get(url) ?? 0) <= now());
+  const cooling = order.filter((url) => (overpassCooldownUntil.get(url) ?? 0) > now());
+  const attempts = [...healthy, ...cooling];
+
+  for (const url of attempts) {
+    const remaining = OVERPASS_TOTAL_BUDGET_MS - (now() - startedAt);
+    if (remaining < 3000) break;
+    try {
+      const response = await fetchWithTimeout(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8", "User-Agent": APP_USER_AGENT },
+        body: new URLSearchParams({ data: query }),
+      }, Math.min(OVERPASS_ATTEMPT_TIMEOUT_MS, remaining));
+      if (!response.ok) throw new Error(`overpass ${response.status}`);
+      const data = (await response.json()) as { elements?: OSMElement[]; remark?: string };
+      // Overpass can answer 200 with only a "remark" (e.g. query timed out); treat that as a failure.
+      if (!Array.isArray(data.elements) || (data.elements.length === 0 && data.remark)) throw new Error("overpass remark");
+      overpassPreferred = OVERPASS_ENDPOINTS.indexOf(url);
+      overpassCooldownUntil.delete(url);
+      return data.elements;
+    } catch {
+      overpassCooldownUntil.set(url, now() + OVERPASS_COOLDOWN_MS);
+    }
+  }
+  throw new Error("장소 검색 도구가 잠시 응답하지 않아요.");
 }
 
 function cuisineFrom(tags: Record<string, string>) {
