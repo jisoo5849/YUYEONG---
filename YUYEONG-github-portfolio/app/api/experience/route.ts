@@ -76,7 +76,7 @@ type ReActCycle = {
   replan: boolean;
 };
 
-const APP_USER_AGENT = "YUYEONG-Experience-Agent/1.0 (https://yuyeong-agent.jisoo584983761.chatgpt.site)";
+const APP_USER_AGENT = "YUYEONG-Experience-Agent/1.0 (https://yuyeong-experience-agent.yuyeong.workers.dev)";
 const RECOMMENDATION_LIMIT = 4;
 const MIN_DRIVE_MINUTES = 20;
 const geocodeCache = new Map<string, { expiresAt: number; value: { coordinates: Coordinates; label: string } }>();
@@ -322,8 +322,98 @@ async function getPlaces(origin: Coordinates, includeDrive: boolean, expanded = 
     relation(around:${localRadius},${lat},${lon})["amenity"~"^(restaurant|fast_food|food_court|cafe)$"]["name"];
     ${driveQuery}
   );out center tags 520;`;
-  const elements = await fetchOverpassElements(query);
-  return { elements, localRadius, driveRadius };
+  let elements: OSMElement[];
+  let source: "overpass" | "nominatim" = "overpass";
+  try {
+    elements = await fetchOverpassElements(query);
+  } catch {
+    // Every Overpass server is busy: fall back to Nominatim's category search (still live
+    // OpenStreetMap data, just with fewer tags per place).
+    elements = await fetchNominatimPlaces(origin, localRadius, driveRadius, includeDrive);
+    source = "nominatim";
+  }
+  return { elements, localRadius, driveRadius, source };
+}
+
+async function waitForNominatimSlot() {
+  const slot = nominatimQueue.then(async () => {
+    const waitFor = Math.max(0, 1100 - (Date.now() - lastNominatimRequestAt));
+    if (waitFor > 0) await new Promise((resolve) => setTimeout(resolve, waitFor));
+    lastNominatimRequestAt = Date.now();
+  });
+  nominatimQueue = slot.catch(() => undefined);
+  await slot;
+}
+
+type NominatimPlace = {
+  category?: string;
+  type?: string;
+  name?: string;
+  lat: string;
+  lon: string;
+  osm_type?: string;
+  osm_id?: number;
+  extratags?: Record<string, string> | null;
+};
+
+async function fetchNominatimPlaces(origin: Coordinates, localRadius: number, driveRadius: number, includeDrive: boolean): Promise<OSMElement[]> {
+  const boxFor = (radius: number) => {
+    const dLat = radius / 111320;
+    const dLon = radius / (111320 * Math.max(0.2, Math.cos((origin.latitude * Math.PI) / 180)));
+    return [origin.longitude - dLon, origin.latitude + dLat, origin.longitude + dLon, origin.latitude - dLat].map((n) => n.toFixed(6)).join(",");
+  };
+  const searches = [
+    { term: "restaurant", radius: localRadius },
+    { term: "cafe", radius: localRadius },
+    ...(includeDrive
+      ? [
+          { term: "park", radius: driveRadius },
+          { term: "viewpoint", radius: driveRadius },
+          { term: "attraction", radius: driveRadius },
+        ]
+      : []),
+  ];
+  const found = new Map<string, OSMElement>();
+
+  for (const search of searches) {
+    try {
+      await waitForNominatimSlot();
+      const params = new URLSearchParams({
+        q: search.term,
+        viewbox: boxFor(search.radius),
+        bounded: "1",
+        limit: "40",
+        extratags: "1",
+        format: "jsonv2",
+        "accept-language": "ko",
+      });
+      const response = await fetchWithTimeout(`https://nominatim.openstreetmap.org/search?${params}`, {
+        headers: { "User-Agent": APP_USER_AGENT, "Accept-Language": "ko,en;q=0.7" },
+      }, 10000);
+      if (!response.ok) continue;
+      const results = (await response.json()) as NominatimPlace[];
+      for (const item of results) {
+        const lat = Number(item.lat);
+        const lon = Number(item.lon);
+        if (!item.name || !item.category || !item.type || !item.osm_type || item.osm_id == null) continue;
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+        const key = `${item.osm_type}-${item.osm_id}`;
+        if (found.has(key)) continue;
+        found.set(key, {
+          id: item.osm_id,
+          type: item.osm_type,
+          lat,
+          lon,
+          tags: { ...(item.extratags ?? {}), name: item.name, [item.category]: item.type },
+        });
+      }
+    } catch {
+      // Skip this category and keep whatever the other searches return.
+    }
+  }
+
+  if (found.size === 0) throw new Error("장소 검색 도구가 잠시 응답하지 않아요.");
+  return [...found.values()];
 }
 
 // Public Overpass servers are shared and often hit their capacity limit (HTTP 429/502/504 or no
@@ -335,8 +425,9 @@ const OVERPASS_ENDPOINTS = [
   "https://overpass.kumi.systems/api/interpreter",
   "https://overpass.private.coffee/api/interpreter",
 ];
-const OVERPASS_ATTEMPT_TIMEOUT_MS = 20000;
-const OVERPASS_TOTAL_BUDGET_MS = 60000;
+const OVERPASS_ATTEMPT_TIMEOUT_MS = 9000;
+const OVERPASS_PROBE_TIMEOUT_MS = 5000;
+const OVERPASS_TOTAL_BUDGET_MS = 22000;
 const OVERPASS_COOLDOWN_MS = 60000;
 const overpassCooldownUntil = new Map<string, number>();
 let overpassPreferred = 0;
@@ -348,7 +439,9 @@ async function fetchOverpassElements(query: string): Promise<OSMElement[]> {
   const order = OVERPASS_ENDPOINTS.map((_, i) => (overpassPreferred + i) % OVERPASS_ENDPOINTS.length).map((i) => OVERPASS_ENDPOINTS[i]);
   const healthy = order.filter((url) => (overpassCooldownUntil.get(url) ?? 0) <= now());
   const cooling = order.filter((url) => (overpassCooldownUntil.get(url) ?? 0) > now());
-  const attempts = [...healthy, ...cooling];
+  // When every server failed recently, only probe one of them briefly so the caller can fall back fast.
+  const attempts = healthy.length > 0 ? healthy : cooling.slice(0, 1);
+  const attemptTimeout = healthy.length > 0 ? OVERPASS_ATTEMPT_TIMEOUT_MS : OVERPASS_PROBE_TIMEOUT_MS;
 
   for (const url of attempts) {
     const remaining = OVERPASS_TOTAL_BUDGET_MS - (now() - startedAt);
@@ -358,7 +451,7 @@ async function fetchOverpassElements(query: string): Promise<OSMElement[]> {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8", "User-Agent": APP_USER_AGENT },
         body: new URLSearchParams({ data: query }),
-      }, Math.min(OVERPASS_ATTEMPT_TIMEOUT_MS, remaining));
+      }, Math.min(attemptTimeout, remaining));
       if (!response.ok) throw new Error(`overpass ${response.status}`);
       const data = (await response.json()) as { elements?: OSMElement[]; remark?: string };
       // Overpass can answer 200 with only a "remark" (e.g. query timed out); treat that as a failure.
@@ -954,7 +1047,7 @@ export async function POST(request: NextRequest) {
     let places = normalizePlaces(placeElements);
     reactRun.record({
       action: { tool: "Places", label: "주변 장소 탐색", input: `반경 ${(localPlacesResult.localRadius / 1000).toFixed(1)}km` },
-      observation: { status: "grounded", summary: `이름과 좌표가 있는 장소 ${places.length}곳을 확인했어요.`, facts: [`식당 ${places.filter((place) => place.kind === "restaurant").length}곳`, `카페 ${places.filter((place) => place.kind === "cafe").length}곳`] },
+      observation: { status: "grounded", summary: `이름과 좌표가 있는 장소 ${places.length}곳을 확인했어요.`, facts: [`식당 ${places.filter((place) => place.kind === "restaurant").length}곳`, `카페 ${places.filter((place) => place.kind === "cafe").length}곳`, ...(localPlacesResult.source === "nominatim" ? ["주 검색 서버가 혼잡해 보조 검색(Nominatim)을 사용했어요. 메뉴·분위기 정보가 적을 수 있어요."] : [])] },
       decision: "검증된 후보를 사용자 조건으로 랭킹합니다.",
       replan: false,
     });
