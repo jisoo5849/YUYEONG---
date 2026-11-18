@@ -273,6 +273,15 @@ function weatherDescription(code: number) {
 }
 
 async function getWeather(coordinates: Coordinates): Promise<Weather> {
+  const weatherKey = `${coordinates.latitude.toFixed(2)},${coordinates.longitude.toFixed(2)}`;
+  const cachedWeather = cacheGet(weatherCache, weatherKey);
+  if (cachedWeather) return cachedWeather;
+  const fresh = await loadWeather(coordinates);
+  cacheSet(weatherCache, weatherKey, fresh, WEATHER_TTL_MS);
+  return fresh;
+}
+
+async function loadWeather(coordinates: Coordinates): Promise<Weather> {
   const params = new URLSearchParams({
     latitude: coordinates.latitude.toString(),
     longitude: coordinates.longitude.toString(),
@@ -304,7 +313,45 @@ async function getWeather(coordinates: Coordinates): Promise<Weather> {
   };
 }
 
-async function getPlaces(origin: Coordinates, includeDrive: boolean, expanded = false) {
+// Results are kept in memory per Worker instance so repeated requests for the same area are instant.
+type CacheEntry<T> = { expiresAt: number; value: T };
+function cacheGet<T>(map: Map<string, CacheEntry<T>>, key: string): T | null {
+  const hit = map.get(key);
+  if (!hit) return null;
+  if (hit.expiresAt <= Date.now()) {
+    map.delete(key);
+    return null;
+  }
+  return hit.value;
+}
+function cacheSet<T>(map: Map<string, CacheEntry<T>>, key: string, value: T, ttlMs: number, maxEntries = 60) {
+  if (map.size >= maxEntries) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+  map.set(key, { expiresAt: Date.now() + ttlMs, value });
+}
+
+type PlacesResult = { elements: OSMElement[]; localRadius: number; driveRadius: number; source: "overpass" | "nominatim" };
+const PLACES_TTL_MS = 6 * 60 * 60 * 1000;
+const PLACES_FALLBACK_TTL_MS = 20 * 60 * 1000; // retry the richer Overpass data sooner
+const WEATHER_TTL_MS = 15 * 60 * 1000;
+const RESPONSE_TTL_MS = 15 * 60 * 1000;
+const RESPONSE_DEGRADED_TTL_MS = 2 * 60 * 1000;
+const placesCache = new Map<string, CacheEntry<PlacesResult>>();
+const weatherCache = new Map<string, CacheEntry<Weather>>();
+const responseCache = new Map<string, CacheEntry<Record<string, unknown>>>();
+
+async function getPlaces(origin: Coordinates, includeDrive: boolean, expanded = false): Promise<PlacesResult> {
+  const key = `${origin.latitude.toFixed(3)},${origin.longitude.toFixed(3)}|${includeDrive ? "drive" : "local"}|${expanded ? "wide" : "base"}`;
+  const cached = cacheGet(placesCache, key);
+  if (cached) return cached;
+  const fresh = await loadPlaces(origin, includeDrive, expanded);
+  cacheSet(placesCache, key, fresh, fresh.source === "overpass" ? PLACES_TTL_MS : PLACES_FALLBACK_TTL_MS);
+  return fresh;
+}
+
+async function loadPlaces(origin: Coordinates, includeDrive: boolean, expanded = false): Promise<PlacesResult> {
   const localRadius = expanded ? 8000 : includeDrive ? 5200 : 3400;
   const driveRadius = expanded ? 30000 : 18000;
   const lat = origin.latitude.toFixed(6);
@@ -427,43 +474,52 @@ const OVERPASS_ENDPOINTS = [
 ];
 const OVERPASS_ATTEMPT_TIMEOUT_MS = 9000;
 const OVERPASS_PROBE_TIMEOUT_MS = 5000;
-const OVERPASS_TOTAL_BUDGET_MS = 22000;
 const OVERPASS_COOLDOWN_MS = 60000;
 const overpassCooldownUntil = new Map<string, number>();
 let overpassPreferred = 0;
 
 async function fetchOverpassElements(query: string): Promise<OSMElement[]> {
-  const startedAt = Date.now();
   const now = () => Date.now();
-  // Healthy servers first (starting from the last one that worked), recently failed ones last.
-  const order = OVERPASS_ENDPOINTS.map((_, i) => (overpassPreferred + i) % OVERPASS_ENDPOINTS.length).map((i) => OVERPASS_ENDPOINTS[i]);
-  const healthy = order.filter((url) => (overpassCooldownUntil.get(url) ?? 0) <= now());
-  const cooling = order.filter((url) => (overpassCooldownUntil.get(url) ?? 0) > now());
+  const healthy = OVERPASS_ENDPOINTS.filter((url) => (overpassCooldownUntil.get(url) ?? 0) <= now());
   // When every server failed recently, only probe one of them briefly so the caller can fall back fast.
-  const attempts = healthy.length > 0 ? healthy : cooling.slice(0, 1);
-  const attemptTimeout = healthy.length > 0 ? OVERPASS_ATTEMPT_TIMEOUT_MS : OVERPASS_PROBE_TIMEOUT_MS;
+  const attempts = healthy.length > 0 ? healthy : [OVERPASS_ENDPOINTS[overpassPreferred]];
+  const timeoutMs = healthy.length > 0 ? OVERPASS_ATTEMPT_TIMEOUT_MS : OVERPASS_PROBE_TIMEOUT_MS;
+  const controllers = attempts.map(() => new AbortController());
+  let finished = false;
 
-  for (const url of attempts) {
-    const remaining = OVERPASS_TOTAL_BUDGET_MS - (now() - startedAt);
-    if (remaining < 3000) break;
+  // Ask every healthy server at once and use whichever answers first.
+  const tasks = attempts.map(async (url, index) => {
+    const timer = setTimeout(() => controllers[index].abort(), timeoutMs);
     try {
-      const response = await fetchWithTimeout(url, {
+      const response = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8", "User-Agent": APP_USER_AGENT },
         body: new URLSearchParams({ data: query }),
-      }, Math.min(attemptTimeout, remaining));
+        signal: controllers[index].signal,
+      });
       if (!response.ok) throw new Error(`overpass ${response.status}`);
       const data = (await response.json()) as { elements?: OSMElement[]; remark?: string };
       // Overpass can answer 200 with only a "remark" (e.g. query timed out); treat that as a failure.
       if (!Array.isArray(data.elements) || (data.elements.length === 0 && data.remark)) throw new Error("overpass remark");
-      overpassPreferred = OVERPASS_ENDPOINTS.indexOf(url);
-      overpassCooldownUntil.delete(url);
-      return data.elements;
-    } catch {
-      overpassCooldownUntil.set(url, now() + OVERPASS_COOLDOWN_MS);
+      return { url, elements: data.elements };
+    } catch (error) {
+      if (!finished) overpassCooldownUntil.set(url, now() + OVERPASS_COOLDOWN_MS);
+      throw error;
+    } finally {
+      clearTimeout(timer);
     }
+  });
+
+  try {
+    const winner = await Promise.any(tasks);
+    finished = true;
+    controllers.forEach((controller) => controller.abort());
+    overpassPreferred = OVERPASS_ENDPOINTS.indexOf(winner.url);
+    overpassCooldownUntil.delete(winner.url);
+    return winner.elements;
+  } catch {
+    throw new Error("장소 검색 도구가 잠시 응답하지 않아요.");
   }
-  throw new Error("장소 검색 도구가 잠시 응답하지 않아요.");
 }
 
 function cuisineFrom(tags: Record<string, string>) {
@@ -1011,6 +1067,16 @@ export async function POST(request: NextRequest) {
     if (activities.length === 0) return jsonError("하나 이상의 경험을 선택해주세요.");
     if (!coordinatesInput && query.length < 2) return jsonError("역이나 건물 이름처럼 출발 위치를 조금 더 구체적으로 알려주세요.");
 
+    const responseKey = JSON.stringify([
+      query.toLocaleLowerCase("ko-KR"),
+      coordinatesInput ? [coordinatesInput.latitude.toFixed(4), coordinatesInput.longitude.toFixed(4)] : null,
+      companion, mood, startTime, endTime, requestedTransport, [...activities].sort(), preferences, budgetTier,
+    ]);
+    const cachedResponse = cacheGet(responseCache, responseKey);
+    if (cachedResponse) {
+      return NextResponse.json({ ...cachedResponse, meta: { ...(cachedResponse.meta as Record<string, unknown>), cached: true } });
+    }
+
     const reactRun = createReActTrace();
     const geocoded = coordinatesInput ? null : await geocode(query);
     if (!coordinatesInput && !geocoded) return jsonError("그 지역을 찾지 못했어요. ‘성수역, 서울’처럼 역이나 건물 이름을 포함해주세요.", 404);
@@ -1023,6 +1089,10 @@ export async function POST(request: NextRequest) {
       decision: "출발점이 확인되어 날씨 관찰로 진행합니다.",
       replan: false,
     });
+
+    // Start the place search now so it runs while the weather request is in flight.
+    const placesPromise = getPlaces(origin, activities.includes("drive"));
+    placesPromise.catch(() => undefined);
 
     let weather: Weather | null = null;
     try {
@@ -1042,7 +1112,7 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    const localPlacesResult = await getPlaces(origin, activities.includes("drive"));
+    const localPlacesResult = await placesPromise;
     let placeElements = localPlacesResult.elements;
     let places = normalizePlaces(placeElements);
     reactRun.record({
@@ -1380,7 +1450,7 @@ export async function POST(request: NextRequest) {
       replan: false,
     });
     const react = reactRun.result("필수 일관성 검사를 통과하고 추가 도구 호출이 필요하지 않아 종료했어요.");
-    return NextResponse.json({
+    const payload = {
       location: { label: locationLabel, ...origin },
       context: {
         companion,
@@ -1421,7 +1491,11 @@ export async function POST(request: NextRequest) {
         weatherSource: "Open-Meteo",
         routeSource: route.source,
       },
-    });
+    };
+    // Keep full results briefly; degraded ones (model or route fell back) only for a moment.
+    const degraded = model.status !== "active" || route.source !== "OSRM";
+    cacheSet(responseCache, responseKey, payload as Record<string, unknown>, degraded ? RESPONSE_DEGRADED_TTL_MS : RESPONSE_TTL_MS, 40);
+    return NextResponse.json(payload);
   } catch (error) {
     const message = error instanceof Error ? error.message : "하루의 경험을 설계하는 중 문제가 생겼어요.";
     return jsonError(message, 503);
